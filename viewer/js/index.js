@@ -11,294 +11,449 @@ GlobalWorkerOptions.workerSrc = "/viewer/js/worker.js";
 
 let pdfDoc = null;
 let outlineAbort = new AbortController();
-let pageRendering = false;
-let renderPending = false;
-let renderPendingZoom = 0;
-const canvas = document.getElementById("content");
 const container = document.getElementById("container");
-let orientationDegrees = 0;
-let zoomRatio = 1;
-let textLayerDiv = document.getElementById("text");
-let task = null;
 
-let newPageNumber = 0;
-let newZoomRatio = 1;
-let useRender;
+let pageViews = [];
+// Pages that currently hold a canvas and/or text layer.
+const renderedViews = new Set();
+// Scale-1 page size (including the document rotation) used for pages not yet loaded.
+let defaultBase = { width: 612, height: 792 };
+let appliedZoom = 0;
+let appliedRotation = 0;
+// Incremented on every zoom/rotation change, invalidating all rendered pages and renders in flight.
+let layoutGen = 0;
 
-const cache = [];
-const maxCached = 6;
+let pumping = false;
+let pinching = false;
+let activeView = null;
+let activeCancel = null;
+
+let reportedPage = 0;
+let jumpTargetY = null;
+let scrollQueued = false;
 
 let isTextLayerVisible = false;
 let userZoomed = false;
 
-function maybeRenderNextPage() {
-    if (renderPending) {
-        pageRendering = false;
-        renderPending = false;
-        renderPage(channel.getPage(), renderPendingZoom, false);
-        return true;
-    }
-    return false;
-}
-
-function handleRenderingError(error) {
-    console.log("rendering error: " + error);
-
-    pageRendering = false;
-    maybeRenderNextPage();
-}
-
-function doPrerender(pageNumber, prerenderTrigger) {
-    if (useRender) {
-        if (pageNumber + 1 <= pdfDoc.numPages) {
-            renderPage(pageNumber + 1, false, true, pageNumber);
-        } else if (pageNumber - 1 > 0) {
-            renderPage(pageNumber - 1, false, true, pageNumber);
-        }
-    } else if (pageNumber === prerenderTrigger + 1) {
-        if (prerenderTrigger - 1 > 0) {
-            renderPage(prerenderTrigger - 1, false, true, prerenderTrigger);
-        }
-    }
-}
-
-function display(newCanvas, zoom) {
-    canvas.height = newCanvas.height;
-    canvas.width = newCanvas.width;
-    canvas.style.height = newCanvas.style.height;
-    canvas.style.width = newCanvas.style.width;
-    canvas.getContext("2d", { alpha: false }).drawImage(newCanvas, 0, 0);
-    if (!zoom) {
-        scrollTo(0, 0);
-    }
-}
-
-function setLayerTransform(pageWidth, pageHeight, layerDiv) {
-    const cs = globalThis.getComputedStyle(canvas);
-    const insetLeft = parseFloat(cs.paddingLeft) || 0;
-    const insetTop = parseFloat(cs.paddingTop) || 0;
-    const insetRight = parseFloat(cs.paddingRight) || 0;
-    const insetBottom = parseFloat(cs.paddingBottom) || 0;
-
-    const isOverflownY = canvas.clientHeight > document.body.clientHeight;
-    const isOverflownX = canvas.clientWidth > document.body.clientWidth;
-    // Translate the text layer to stay aligned with the rendered page including canvas insets and
-    // grid centering effects.
-    const translate = {
-        X: isOverflownX
-            ? insetLeft - (document.body.clientWidth - pageWidth) / 2
-            : (insetLeft - insetRight) / 2,
-        Y: isOverflownY
-            ? insetTop - (document.body.clientHeight - pageHeight) / 2
-            : (insetTop - insetBottom) / 2
+function insetsInCssPixels() {
+    const ratio = globalThis.devicePixelRatio;
+    return {
+        left: channel.getInsetLeft() / ratio,
+        top: channel.getInsetTop() / ratio,
+        right: channel.getInsetRight() / ratio,
+        bottom: channel.getInsetBottom() / ratio
     };
-    layerDiv.style.translate = `${translate.X}px ${translate.Y}px`;
 }
 
-function getDefaultZoomRatio(page, degrees) {
-    const totalRotation = (degrees + page.rotate) % 360;
-    const viewport = page.getViewport({scale: 1, rotation: totalRotation});
-    const widthZoomRatio = document.body.clientWidth / viewport.width;
-    const heightZoomRatio = document.body.clientHeight / viewport.height;
-    return Math.max(Math.min(widthZoomRatio, heightZoomRatio, channel.getMaxZoomRatio()), channel.getMinZoomRatio());
+// Add padding around the pages to allow them to be scrolled below/above any system/app ui that
+// might be visible.
+function applyInsets() {
+    const insets = insetsInCssPixels();
+    container.style.paddingLeft = insets.left + "px";
+    container.style.paddingTop = insets.top + "px";
+    container.style.paddingRight = insets.right + "px";
+    container.style.paddingBottom = insets.bottom + "px";
 }
 
-function renderPage(pageNumber, zoom, prerender, prerenderTrigger = 0) {
-    pageRendering = true;
-    useRender = !prerender;
+function setDefaultBase(width, height) {
+    defaultBase = { width, height };
+    container.style.setProperty("--base-width", width + "px");
+    container.style.setProperty("--base-height", height + "px");
+}
 
-    newPageNumber = pageNumber;
-    newZoomRatio = channel.getZoomRatio();
-    orientationDegrees = channel.getDocumentOrientationDegrees();
-    console.log("page: " + pageNumber + ", zoom: " + newZoomRatio +
-                ", orientationDegrees: " + orientationDegrees + ", prerender: " + prerender);
-    for (let i = 0; !zoom && i < cache.length; i++) {
-        const cached = cache[i];
-        if (cached.pageNumber === pageNumber && cached.zoomRatio === newZoomRatio &&
-                cached.orientationDegrees === orientationDegrees) {
-            if (useRender) {
-                cache.splice(i, 1);
-                cache.push(cached);
+function pageTop(pv) {
+    return pv.div.getBoundingClientRect().top + globalThis.scrollY;
+}
 
-                display(cached.canvas, zoom);
-                zoomRatio = newZoomRatio;
+// Index of the last page starting at or above the given document offset.
+function findPageAt(y) {
+    let lo = 0;
+    let hi = pageViews.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (pageTop(pageViews[mid]) <= y) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
 
-                textLayerDiv.replaceWith(cached.textLayerDiv);
-                textLayerDiv = cached.textLayerDiv;
-                setLayerTransform(cached.pageWidth, cached.pageHeight, textLayerDiv);
-                container.style.setProperty("--scale-factor", newZoomRatio.toString());
-                textLayerDiv.hidden = false;
+function captureAnchor() {
+    const y = globalThis.scrollY;
+    const pv = pageViews[findPageAt(y)];
+    return { pv, fraction: (y - pageTop(pv)) / pv.div.offsetHeight };
+}
+
+function restoreAnchor(anchor) {
+    const y = pageTop(anchor.pv) + anchor.fraction * anchor.pv.div.offsetHeight;
+    globalThis.scrollTo(globalThis.scrollX, y);
+}
+
+function setPageBase(pv, width, height) {
+    if (pv.baseWidth === width && pv.baseHeight === height) {
+        return;
+    }
+    const heightBefore = pv.div.offsetHeight;
+    const bottomBefore = pageTop(pv) + heightBefore;
+    pv.baseWidth = width;
+    pv.baseHeight = height;
+    pv.div.style.setProperty("--base-width", width + "px");
+    pv.div.style.setProperty("--base-height", height + "px");
+    // Keep the content in view still when a page above it changes size.
+    if (bottomBefore <= globalThis.scrollY) {
+        globalThis.scrollBy(0, pv.div.offsetHeight - heightBefore);
+    }
+}
+
+function getFitWidthZoomRatio(baseWidth) {
+    const insets = insetsInCssPixels();
+    const available = document.body.clientWidth - insets.left - insets.right;
+    return Math.max(Math.min(available / baseWidth, channel.getMaxZoomRatio()),
+        channel.getMinZoomRatio());
+}
+
+function createPageViews(numPages) {
+    const views = [];
+    const fragment = document.createDocumentFragment();
+    for (let i = 1; i <= numPages; i++) {
+        const div = document.createElement("div");
+        div.className = "page";
+        fragment.append(div);
+        views.push({
+            num: i,
+            div,
+            canvas: null,
+            textDiv: null,
+            baseWidth: null,
+            baseHeight: null,
+            renderedGen: -1,
+            failedGen: -1
+        });
+    }
+    container.replaceChildren(fragment);
+    return views;
+}
+
+function releaseView(pv) {
+    if (activeView === pv) {
+        cancelActive();
+    }
+    if (pv.canvas !== null) {
+        // Free the bitmap memory right away rather than waiting for garbage collection.
+        pv.canvas.width = 0;
+        pv.canvas.remove();
+        pv.canvas = null;
+    }
+    if (pv.textDiv !== null) {
+        pv.textDiv.remove();
+        pv.textDiv = null;
+    }
+    pv.renderedGen = -1;
+    renderedViews.delete(pv);
+}
+
+function cancelActive() {
+    if (activeCancel !== null) {
+        activeCancel();
+    }
+}
+
+function applyView(zoom, rotation) {
+    layoutGen++;
+    cancelActive();
+
+    if (rotation !== appliedRotation) {
+        if ((rotation - appliedRotation) % 180 !== 0) {
+            setDefaultBase(defaultBase.height, defaultBase.width);
+            for (const pv of pageViews) {
+                if (pv.baseWidth !== null) {
+                    const width = pv.baseHeight;
+                    pv.baseHeight = pv.baseWidth;
+                    pv.baseWidth = width;
+                    pv.div.style.setProperty("--base-width", pv.baseWidth + "px");
+                    pv.div.style.setProperty("--base-height", pv.baseHeight + "px");
+                }
             }
+        }
+        appliedRotation = rotation;
+    }
 
-            pageRendering = false;
-            doPrerender(pageNumber, prerenderTrigger);
+    appliedZoom = zoom;
+    container.style.setProperty("--scale-factor", zoom.toString());
+
+    // Existing text layers no longer match the page until it is rendered again.
+    for (const pv of renderedViews) {
+        if (pv.textDiv !== null) {
+            pv.textDiv.hidden = true;
+        }
+    }
+}
+
+function scrollToPage(pageNumber) {
+    const pv = pageViews[pageNumber - 1];
+    if (pv === undefined) {
+        return;
+    }
+    globalThis.scrollTo(globalThis.scrollX, pageTop(pv) - insetsInCssPixels().top);
+    jumpTargetY = globalThis.scrollY;
+    reportedPage = pageNumber;
+    updateVisible();
+}
+
+function updateCurrentPage() {
+    const y = globalThis.scrollY;
+    if (jumpTargetY !== null) {
+        if (Math.abs(y - jumpTargetY) < 1) {
             return;
+        }
+        jumpTargetY = null;
+    }
+
+    const viewportHeight = globalThis.innerHeight;
+    let pageNumber;
+    if (y <= 0) {
+        pageNumber = 1;
+    } else if (y + viewportHeight >= document.documentElement.scrollHeight - 1) {
+        pageNumber = pageViews.length;
+    } else {
+        pageNumber = findPageAt(y + viewportHeight / 2) + 1;
+    }
+    if (pageNumber !== reportedPage) {
+        reportedPage = pageNumber;
+        channel.setPage(pageNumber);
+    }
+}
+
+function updateVisible() {
+    if (pageViews.length === 0) {
+        return;
+    }
+    const y = globalThis.scrollY;
+    const viewportHeight = globalThis.innerHeight;
+
+    const keepFirst = findPageAt(y - viewportHeight);
+    const keepLast = findPageAt(y + viewportHeight * 2);
+    for (const pv of renderedViews) {
+        if (pv.num - 1 < keepFirst || pv.num - 1 > keepLast) {
+            releaseView(pv);
         }
     }
 
-    pdfDoc.getPage(pageNumber).then(function(page) {
-        if (maybeRenderNextPage()) {
+    if (activeView !== null) {
+        const wantFirst = findPageAt(y - viewportHeight / 2);
+        const wantLast = findPageAt(y + viewportHeight * 1.5);
+        if (activeView.num - 1 < wantFirst || activeView.num - 1 > wantLast) {
+            cancelActive();
+        }
+    }
+
+    schedule();
+}
+
+function nextViewToRender() {
+    const y = globalThis.scrollY;
+    const viewportHeight = globalThis.innerHeight;
+    const first = findPageAt(y - viewportHeight / 2);
+    const last = findPageAt(y + viewportHeight * 1.5);
+    const center = y + viewportHeight / 2;
+
+    let best = null;
+    let bestDistance = Infinity;
+    for (let i = first; i <= last; i++) {
+        const pv = pageViews[i];
+        if (pv.renderedGen === layoutGen || pv.failedGen === layoutGen) {
+            continue;
+        }
+        const distance = Math.abs(pageTop(pv) + pv.div.offsetHeight / 2 - center);
+        if (distance < bestDistance) {
+            best = pv;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+function schedule() {
+    if (!pumping && !pinching) {
+        pump();
+    }
+}
+
+async function pump() {
+    pumping = true;
+    try {
+        while (!pinching) {
+            const pv = nextViewToRender();
+            if (pv === null) {
+                break;
+            }
+            await renderView(pv);
+        }
+    } finally {
+        pumping = false;
+    }
+}
+
+async function renderView(pv) {
+    const gen = layoutGen;
+    const zoom = appliedZoom;
+    const rotation = appliedRotation;
+    let cancelled = false;
+    let current = null;
+    activeView = pv;
+    activeCancel = () => {
+        cancelled = true;
+        if (current !== null) {
+            current.cancel();
+        }
+    };
+
+    try {
+        const page = await pdfDoc.getPage(pv.num);
+        if (cancelled) {
             return;
         }
 
-        const defaultZoomRatio = getDefaultZoomRatio(page, orientationDegrees);
+        const totalRotation = (rotation + page.rotate) % 360;
+        const baseViewport = page.getViewport({ scale: 1, rotation: totalRotation });
+        setPageBase(pv, baseViewport.width, baseViewport.height);
 
-        if (newZoomRatio === 0) {
-            zoomRatio = defaultZoomRatio;
-            newZoomRatio = defaultZoomRatio;
-            channel.setZoomRatio(defaultZoomRatio);
-        }
-
-        const totalRotation = (orientationDegrees + page.rotate) % 360;
-        const viewport = page.getViewport({scale: newZoomRatio, rotation: totalRotation});
-
-        const scaleFactor = newZoomRatio / zoomRatio;
+        const viewport = page.getViewport({ scale: zoom, rotation: totalRotation });
         const ratio = globalThis.devicePixelRatio;
+        const renderPixels = viewport.height * ratio * viewport.width * ratio;
 
-        if (useRender) {
-            if (newZoomRatio !== zoomRatio) {
-                canvas.style.height = viewport.height + "px";
-                canvas.style.width = viewport.width + "px";
-            }
-            zoomRatio = newZoomRatio;
-        }
-
-        if (zoom === 1 || zoom === 2) {
-            // Focus point in CSS px, in viewport coordinates.
-            const focusX = zoom === 2
-                ? channel.getZoomFocusX() / ratio
-                : globalThis.innerWidth / 2;
-            const focusY = zoom === 2
-                ? channel.getZoomFocusY() / ratio
-                : globalThis.innerHeight / 2;
-
-            // focus relative to page origin, rather than screen origin
-            const globalFocusX = focusX + globalThis.scrollX;
-            const globalFocusY = focusY + globalThis.scrollY;
-
-            const translationFactor = scaleFactor - 1;
-            scrollBy(globalFocusX * translationFactor, globalFocusY * translationFactor);
-
-            if (zoom === 2) {
-                textLayerDiv.hidden = true;
-                pageRendering = false;
-                return;
-            }
-        }
-
-        const resolutionY = viewport.height * ratio;
-        const resolutionX = viewport.width * ratio;
-        const renderPixels = resolutionY * resolutionX;
-
-        let newViewport = viewport;
+        let renderViewport = viewport;
         const maxRenderPixels = channel.getMaxRenderPixels();
         if (renderPixels > maxRenderPixels) {
             console.log(`resolution ${renderPixels} exceeds maximum allowed ${maxRenderPixels}`);
             const adjustedScale = Math.sqrt(maxRenderPixels / renderPixels);
-            newViewport = page.getViewport({
-                scale: newZoomRatio * adjustedScale,
+            renderViewport = page.getViewport({
+                scale: zoom * adjustedScale,
                 rotation: totalRotation
             });
         }
 
         const newCanvas = document.createElement("canvas");
-        newCanvas.height = newViewport.height * ratio;
-        newCanvas.width = newViewport.width * ratio;
-        // use original viewport height for CSS zoom
-        newCanvas.style.height = viewport.height + "px";
-        newCanvas.style.width = viewport.width + "px";
-        const newContext = newCanvas.getContext("2d", { alpha: false });
-        newContext.scale(ratio, ratio);
+        newCanvas.height = renderViewport.height * ratio;
+        newCanvas.width = renderViewport.width * ratio;
+        const context = newCanvas.getContext("2d", { alpha: false });
+        context.scale(ratio, ratio);
 
-        // Add padding to the canvas to allow the page to be scrolled bellow/above any
-        // system/app ui that might be visible.
-        canvas.style.paddingLeft = (channel.getInsetLeft() / ratio) + "px";
-        canvas.style.paddingTop = (channel.getInsetTop() / ratio) + "px";
-        canvas.style.paddingRight = (channel.getInsetRight() / ratio) + "px";
-        canvas.style.paddingBottom = (channel.getInsetBottom() / ratio) + "px";
-
-        task = page.render({
-            canvasContext: newContext,
-            viewport: newViewport
-        });
-
-        task.promise.then(function() {
-            task = null;
-
-            let rendered = false;
-            function render() {
-                if (!useRender || rendered) {
-                    return;
-                }
-                display(newCanvas, zoom);
-                rendered = true;
-            }
-            render();
-
-            const newTextLayerDiv = textLayerDiv.cloneNode();
-            const textLayer = new TextLayer({
-                textContentSource: page.streamTextContent(),
-                container: newTextLayerDiv,
-                viewport: viewport
-            });
-            task = {
-                promise: textLayer.render(),
-                cancel: () => textLayer.cancel()
-            };
-            task.promise.then(function() {
-                task = null;
-
-                render();
-
-                setLayerTransform(viewport.width, viewport.height, newTextLayerDiv);
-                if (useRender) {
-                    textLayerDiv.replaceWith(newTextLayerDiv);
-                    textLayerDiv = newTextLayerDiv;
-                    container.style.setProperty("--scale-factor", newZoomRatio.toString());
-                    textLayerDiv.hidden = false;
-                }
-
-                if (cache.length === maxCached) {
-                    cache.shift();
-                }
-                cache.push({
-                    pageNumber: pageNumber,
-                    zoomRatio: newZoomRatio,
-                    orientationDegrees: orientationDegrees,
-                    canvas: newCanvas,
-                    textLayerDiv: newTextLayerDiv,
-                    pageWidth: viewport.width,
-                    pageHeight: viewport.height
-                });
-
-                pageRendering = false;
-                doPrerender(pageNumber, prerenderTrigger);
-            }).catch(handleRenderingError);
-        }).catch(handleRenderingError);
-    });
-}
-
-globalThis.onRenderPage = function (zoom) {
-    if (zoom === 1 || zoom === 2) {
-        userZoomed = true;
-    }
-
-    if (pageRendering) {
-        if (newPageNumber === channel.getPage() && newZoomRatio === channel.getZoomRatio() &&
-                orientationDegrees === channel.getDocumentOrientationDegrees()) {
-            useRender = true;
+        const renderTask = page.render({ canvasContext: context, viewport: renderViewport });
+        current = renderTask;
+        await renderTask.promise;
+        if (cancelled) {
             return;
         }
 
-        renderPending = true;
-        renderPendingZoom = zoom;
-        if (task !== null) {
-            task.cancel();
-            task = null;
+        if (pv.canvas !== null) {
+            pv.canvas.width = 0;
+            pv.canvas.replaceWith(newCanvas);
+        } else {
+            pv.div.prepend(newCanvas);
         }
-    } else {
-        renderPage(channel.getPage(), zoom, false);
+        pv.canvas = newCanvas;
+        renderedViews.add(pv);
+
+        const newTextDiv = document.createElement("div");
+        newTextDiv.className = "textLayer";
+        const textLayer = new TextLayer({
+            textContentSource: page.streamTextContent(),
+            container: newTextDiv,
+            viewport: viewport
+        });
+        current = { cancel: () => textLayer.cancel() };
+        await textLayer.render();
+        if (cancelled) {
+            return;
+        }
+
+        if (pv.textDiv !== null) {
+            pv.textDiv.replaceWith(newTextDiv);
+        } else {
+            pv.div.append(newTextDiv);
+        }
+        pv.textDiv = newTextDiv;
+        pv.renderedGen = gen;
+    } catch (error) {
+        if (!cancelled) {
+            console.log("rendering error: " + error);
+            pv.failedGen = gen;
+        }
+    } finally {
+        activeView = null;
+        activeCancel = null;
     }
+}
+
+function onScroll() {
+    scrollQueued = false;
+    if (pdfDoc === null || pageViews.length === 0) {
+        return;
+    }
+    updateCurrentPage();
+    updateVisible();
+}
+
+globalThis.addEventListener("scroll", () => {
+    if (!scrollQueued) {
+        scrollQueued = true;
+        globalThis.requestAnimationFrame(onScroll);
+    }
+}, { passive: true });
+
+/**
+ * @param {number} zoom 0 for any other change (rotation, resize), 1 for a zoom step or the end of
+ * a pinch gesture (around the screen center), 2 for a pinch gesture in progress (around the focus
+ * point supplied by the channel).
+ */
+globalThis.onRenderPage = function (zoom) {
+    if (pdfDoc === null || pageViews.length === 0) {
+        return;
+    }
+    if (zoom === 1 || zoom === 2) {
+        userZoomed = true;
+    }
+    pinching = zoom === 2;
+    applyInsets();
+
+    const newZoom = channel.getZoomRatio();
+    const newRotation = channel.getDocumentOrientationDegrees();
+    const zoomChanged = newZoom !== appliedZoom;
+    const rotationChanged = newRotation !== appliedRotation;
+
+    if (zoomChanged || rotationChanged) {
+        const oldZoom = appliedZoom;
+        const ratio = globalThis.devicePixelRatio;
+        const useFocus = (zoom === 1 || zoom === 2) && !rotationChanged;
+        // Focus point relative to the document origin, rather than the screen origin.
+        const focusX = (zoom === 2 ? channel.getZoomFocusX() / ratio : globalThis.innerWidth / 2) +
+            globalThis.scrollX;
+        const focusY = (zoom === 2 ? channel.getZoomFocusY() / ratio : globalThis.innerHeight / 2) +
+            globalThis.scrollY;
+        const anchor = useFocus ? null : captureAnchor();
+
+        applyView(newZoom, newRotation);
+
+        if (useFocus) {
+            const translationFactor = newZoom / oldZoom - 1;
+            globalThis.scrollBy(focusX * translationFactor, focusY * translationFactor);
+        } else {
+            restoreAnchor(anchor);
+        }
+    }
+
+    jumpTargetY = null;
+    updateVisible();
+};
+
+globalThis.jumpToPage = function (pageNumber) {
+    if (pdfDoc === null || pageViews.length === 0) {
+        return;
+    }
+    scrollToPage(pageNumber);
 };
 
 globalThis.isTextSelected = function () {
@@ -335,8 +490,45 @@ globalThis.toggleTextLayerVisibility = function () {
     isTextLayerVisible = !isTextLayerVisible;
 };
 
+function initPages() {
+    const doc = pdfDoc;
+    doc.getPage(1).then(function (page) {
+        if (doc !== pdfDoc) {
+            return;
+        }
+        const rotation = channel.getDocumentOrientationDegrees();
+        const viewport = page.getViewport({ scale: 1, rotation: (rotation + page.rotate) % 360 });
+
+        layoutGen++;
+        cancelActive();
+        renderedViews.clear();
+        appliedRotation = rotation;
+        setDefaultBase(viewport.width, viewport.height);
+
+        let zoom = channel.getZoomRatio();
+        if (zoom === 0) {
+            zoom = getFitWidthZoomRatio(viewport.width);
+            channel.setZoomRatio(zoom);
+        }
+        appliedZoom = zoom;
+        container.style.setProperty("--scale-factor", zoom.toString());
+        applyInsets();
+
+        pageViews = createPageViews(doc.numPages);
+        setPageBase(pageViews[0], viewport.width, viewport.height);
+        reportedPage = channel.getPage();
+        scrollToPage(reportedPage);
+    }).catch(function (error) {
+        console.log("initPages error: " + error);
+        channel.onLoadError();
+    });
+}
+
 globalThis.loadDocument = function () {
     userZoomed = false;
+    pageViews = [];
+    reportedPage = 0;
+    jumpTargetY = null;
     const pdfPassword = channel.getPassword();
     const loadingTask = getDocument({
         url: "https://localhost/placeholder.pdf",
@@ -382,7 +574,7 @@ globalThis.loadDocument = function () {
         }).catch(function(error) {
             console.log("getOutline error: " + error);
         });
-        renderPage(channel.getPage(), false, false);
+        initPages();
     }, function (reason) {
         console.error(reason.name + ": " + reason.message);
         channel.onLoadError();
@@ -390,16 +582,16 @@ globalThis.loadDocument = function () {
 };
 
 globalThis.onresize = () => {
-    setLayerTransform(canvas.clientWidth, canvas.clientHeight, textLayerDiv);
-    if (pdfDoc !== null && !userZoomed) {
-        const pageNumber = channel.getPage();
-        pdfDoc.getPage(pageNumber).then(function(page) {
-            const degrees = channel.getDocumentOrientationDegrees();
-            const newDefaultZoom = getDefaultZoomRatio(page, degrees);
-            channel.setZoomRatio(newDefaultZoom);
-            globalThis.onRenderPage(0);
-        }).catch(function(err) {
-            console.log("onresize error: " + err);
-        });
+    if (pdfDoc === null || pageViews.length === 0) {
+        return;
     }
+    applyInsets();
+    if (userZoomed) {
+        updateVisible();
+        return;
+    }
+    const pv = pageViews[Math.max(reportedPage, 1) - 1];
+    const width = pv.baseWidth ?? defaultBase.width;
+    channel.setZoomRatio(getFitWidthZoomRatio(width));
+    globalThis.onRenderPage(0);
 };

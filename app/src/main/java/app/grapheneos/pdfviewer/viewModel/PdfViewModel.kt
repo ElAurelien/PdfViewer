@@ -86,6 +86,16 @@ class PdfViewModel(
         _pageIndicator.value++
     }
 
+    /** Called when scrolling brings another page into view. */
+    fun onPageScrolled(value: Int) {
+        viewModelScope.launch {
+            if (value in 1..numPages.value && value != page.value) {
+                setPage(value)
+                showPageIndicator()
+            }
+        }
+    }
+
     enum class PasswordStatus {
         MissingPassword,
         InvalidPassword,

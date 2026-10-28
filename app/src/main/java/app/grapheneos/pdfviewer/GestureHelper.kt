@@ -14,15 +14,12 @@ import android.view.View
 object GestureHelper {
     interface GestureListener {
         fun onTapUp(): Boolean
-        fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean
         fun onZoom(scaleFactor: Float, focusX: Float, focusY: Float)
         fun onZoomEnd()
     }
 
     @SuppressLint("ClickableViewAccessibility")
     fun attach(context: Context, gestureView: View, listener: GestureListener) {
-        var wasScaling = false
-
         val scaleDetector = ScaleGestureDetector(
             context,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -42,29 +39,11 @@ object GestureHelper {
                 override fun onSingleTapUp(e: MotionEvent): Boolean {
                     return listener.onTapUp()
                 }
-
-                override fun onFling(
-                    e1: MotionEvent?,
-                    e2: MotionEvent,
-                    velocityX: Float,
-                    velocityY: Float
-                ): Boolean {
-                    if (wasScaling) return false
-                    return listener.onFling(e1, e2, velocityX, velocityY)
-                }
             })
 
         gestureView.setOnTouchListener { _, event ->
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                wasScaling = false
-            }
-
             detector.onTouchEvent(event)
             scaleDetector.onTouchEvent(event)
-
-            if (scaleDetector.isInProgress) {
-                wasScaling = true
-            }
 
             false
         }

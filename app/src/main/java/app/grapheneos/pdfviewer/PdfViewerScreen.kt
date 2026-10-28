@@ -7,8 +7,6 @@ import android.content.Intent
 import android.icu.text.DecimalFormatSymbols
 import android.icu.text.NumberFormat
 import android.util.Log
-import android.view.MotionEvent
-import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
@@ -130,7 +128,6 @@ import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private const val TAG = "PdfViewerScreen"
@@ -333,10 +330,6 @@ fun PdfViewerScreen(
         }
     }
 
-    val viewConfiguration = remember { ViewConfiguration.get(context) }
-    val swipeThreshold = remember { viewConfiguration.scaledTouchSlop * 6 }
-    val swipeVelocityThreshold = remember { viewConfiguration.scaledMinimumFlingVelocity }
-
     DisposableEffect(webView) {
         val wv = webView ?: return@DisposableEffect onDispose {}
         GestureHelper.attach(context, wv, object : GestureHelper.GestureListener {
@@ -348,30 +341,6 @@ fun PdfViewerScreen(
                     }
                 }
                 return true
-            }
-
-            override fun onFling(
-                e1: MotionEvent?, e2: MotionEvent,
-                velocityX: Float, velocityY: Float
-            ): Boolean {
-                if (e1 == null) return false
-
-                val deltaX = e2.x - e1.x
-                val deltaY = e2.y - e1.y
-
-                if (abs(deltaX) > abs(deltaY) &&
-                    abs(deltaX) > swipeThreshold &&
-                    abs(velocityX) > swipeVelocityThreshold
-                ) {
-                    if (deltaX < 0 && !wv.canScrollHorizontally(1)) {
-                        jumpToPage(viewModel, wv, viewModel.page.value + 1)
-                        return true
-                    } else if (deltaX > 0 && !wv.canScrollHorizontally(-1)) {
-                        jumpToPage(viewModel, wv, viewModel.page.value - 1)
-                        return true
-                    }
-                }
-                return false
             }
 
             override fun onZoom(scaleFactor: Float, focusX: Float, focusY: Float) {
@@ -764,7 +733,7 @@ internal fun jumpToPage(viewModel: PdfViewModel, webView: WebView?, selectedPage
     val num = viewModel.numPages.value
     if (selectedPage in 1..num && viewModel.page.value != selectedPage) {
         viewModel.setPage(selectedPage)
-        webView.evaluateJavascript("onRenderPage(0)", null)
+        webView.evaluateJavascript("jumpToPage($selectedPage)", null)
         viewModel.showPageIndicator()
     }
 }

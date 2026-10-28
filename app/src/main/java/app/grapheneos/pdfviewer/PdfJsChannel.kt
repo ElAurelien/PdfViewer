@@ -25,6 +25,11 @@ class PdfJsChannel(private val viewModel: PdfViewModel) {
     fun getPage(): Int = viewModel.page.value
 
     @JavascriptInterface
+    fun setPage(page: Int) {
+        viewModel.onPageScrolled(page)
+    }
+
+    @JavascriptInterface
     fun getZoomRatio(): Float = viewModel.zoomRatio.value
 
     @JavascriptInterface

@@ -3,10 +3,10 @@ body {
     height: 100%;
 }
 
-body,
-canvas {
+body {
     padding: 0;
     margin: 0;
+    overflow-anchor: none;
 }
 
 body {
@@ -19,23 +19,40 @@ body {
     --total-scale-factor: calc(var(--scale-factor) * var(--user-unit));
     --scale-round-x: 1px;
     --scale-round-y: 1px;
+    --base-width: 612px;
+    --base-height: 792px;
 
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: max-content;
+    min-width: 100%;
+}
+
+.page {
+    flex: none;
+    position: relative;
+    box-sizing: content-box;
+    width: calc(var(--scale-factor) * var(--base-width));
+    height: calc(var(--scale-factor) * var(--base-height));
+    margin-bottom: 8px;
+    background-color: #fff;
+}
+
+.page > canvas {
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 0;
     width: 100%;
     height: 100%;
-    display: grid;
-    place-items: center;
 }
 
-#container canvas,
-#container .textLayer {
-    /* overlay child elements on top of each other */
-    grid-row-start: 1;
-    grid-column-start: 1;
-}
-
-canvas {
-    display: inline-block;
-    position: relative;
+.page > .textLayer {
+    top: 50%;
+    left: 50%;
+    translate: -50% -50%;
 }
 
 [data-main-rotation="90"] {
